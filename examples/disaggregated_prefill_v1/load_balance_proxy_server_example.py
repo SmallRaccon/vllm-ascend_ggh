@@ -291,6 +291,10 @@ class SharedProxyScheduler:
     def __init__(self, prefiller_instances, decoder_instances):
         self._lock = threading.RLock()
         self.request_num = 0
+        self._request_dump_enabled = False
+        self._request_dump_file: str | None = None
+        self._request_dump_handle = None
+        self._dumped_request_num = 0
         self.waiting_nodes: dict[str, tuple[str, tuple[str, int], int]] = {}
         self._pools: dict[ServerRole, RolePools] = {
             ServerRole.PREFILL: RolePools(),
@@ -393,6 +397,7 @@ class SharedProxyScheduler:
                 "prefill_instances": len(self.prefillers),
                 "decode_instances": len(self.decoders),
                 "request_num": self.request_num,
+                "request_dump_enabled": self._request_dump_enabled,
             }
 
     def _pick_server(
@@ -557,6 +562,60 @@ class SharedProxyScheduler:
                 pool.tainted.clear()
                 self._reset_heap(role, bump_seq=True)
                 self.log_status(f"Remove {role.value} instances after drain: {keys}.")
+
+    def start_request_dump(self, output_file: str) -> dict[str, Any]:
+        with self._lock:
+            if self._request_dump_enabled:
+                return {
+                    "status": "already_started",
+                    "output_file": self._request_dump_file,
+                    "dumped_request_num": self._dumped_request_num,
+                }
+
+            dump_path = Path(output_file).expanduser().resolve()
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._request_dump_handle is not None:
+                self._request_dump_handle.close()
+            self._request_dump_handle = dump_path.open("a", encoding="utf-8")
+            self._request_dump_file = str(dump_path)
+            self._dumped_request_num = 0
+            self._request_dump_enabled = True
+            logger.info("Started dumping requests to %s.", dump_path)
+            return {
+                "status": "started",
+                "output_file": self._request_dump_file,
+                "dumped_request_num": self._dumped_request_num,
+            }
+
+    def stop_request_dump(self) -> dict[str, Any]:
+        with self._lock:
+            status = "stopped" if self._request_dump_enabled else "already_stopped"
+            self._request_dump_enabled = False
+            if self._request_dump_handle is not None:
+                self._request_dump_handle.close()
+                self._request_dump_handle = None
+            logger.info("Stopped dumping requests to %s.", self._request_dump_file)
+            return {
+                "status": status,
+                "output_file": self._request_dump_file,
+                "dumped_request_num": self._dumped_request_num,
+            }
+
+    def dump_request(self, endpoint: str, request_data: Any) -> bool:
+        with self._lock:
+            if not self._request_dump_enabled or self._request_dump_handle is None:
+                return False
+            try:
+                line = json.dumps(request_data, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                line = line.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+                line = line.replace(chr(0x2028), "\\u2028").replace(chr(0x2029), "\\u2029")
+                self._request_dump_handle.write(line + "\n")
+                self._request_dump_handle.flush()
+                self._dumped_request_num += 1
+            except Exception as e:
+                logger.error("Failed to write request dump: %s", e)
+                return False
+            return True
 
 
 class SchedulerManager(BaseManager):
@@ -737,6 +796,12 @@ def parse_args() -> argparse.Namespace:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Log level for the proxy server.",
+    )
+    parser.add_argument(
+        "--request-dump-file",
+        type=str,
+        default="request_dump.jsonl",
+        help="JSONL file used by the /start_dump_req endpoint.",
     )
     args = parser.parse_args()
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
@@ -1077,6 +1142,7 @@ async def handle_completions_impl(api: str, request: Request):
     request_released = False
     try:
         req_data = await request.json()
+        await runtime.schedule("dump_request", api, req_data)
         if args.enable_prefill_affinity and (session_id := request.headers.get("X-Session-Id")):
             req_data["user"] = session_id
         if request_id := request.headers.get("X-Request-Id"):
@@ -1418,6 +1484,25 @@ async def handle_add_instances(request: Request):
 @app.post("/instances/remove")
 async def handle_remove_instances(request: Request):
     return await adjust_instances_impl("remove", request)
+
+
+@app.api_route("/start_dump_req", methods=["GET", "POST"])
+async def start_dump_req(request: Request):
+    args = get_global_args()
+    output_file = request.query_params.get("file")
+    if not output_file:
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            output_file = body.get("file") or body.get("output_file")
+    return await get_runtime().schedule("start_request_dump", output_file or args.request_dump_file)
+
+
+@app.api_route("/stop_dump_req", methods=["GET", "POST"])
+async def stop_dump_req():
+    return await get_runtime().schedule("stop_request_dump")
 
 
 if __name__ == "__main__":
